@@ -94,7 +94,7 @@ def test_imports():
     assert b in ("windivert","raw","scapy")
     # importing the POSIX engine module must not blow up on any OS
     import engines.raw_socket_engine as rse
-    fprog, buf = rse._build_bpf("188.114.99.0")
+    fprog, buf = rse._build_bpf("192.168.1.50", "188.114.99.0")
     assert isinstance(fprog, (bytes, bytearray)) and len(fprog) >= 4
     import main  # runs module-level config load; must not raise
     print(f"test_imports OK (detected backend on this host: {b})")

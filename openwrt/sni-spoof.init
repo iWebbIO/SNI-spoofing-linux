@@ -7,6 +7,7 @@
 #
 #   /etc/init.d/sni-spoof enable    # start on boot
 #   /etc/init.d/sni-spoof start
+#   /etc/init.d/sni-spoof check     # diagnose why it is not working
 #   logread -e sni-spoof            # watch output
 USE_PROCD=1
 START=95
@@ -15,19 +16,25 @@ STOP=10
 PROG_DIR=/opt/sni-spoof
 CONF_JSON="$PROG_DIR/config.json"
 
+extra_command "check" "Diagnose the installation and report what is wrong"
+
 # Render config.json from UCI. Echoes the 'enabled' flag on stdout so the caller
 # can decide whether to actually launch (the JSON itself goes to the file).
 gen_config() {
-	local enabled listen_host listen_port connect_ip connect_port fake_sni interface backend
+	local enabled listen_host listen_port connect_ip connect_port fake_sni
+	local interface backend bind_interface
 	config_load 'sni-spoof'
-	config_get enabled      main enabled      0
-	config_get listen_host  main listen_host  '127.0.0.1'
-	config_get listen_port  main listen_port  40443
-	config_get connect_ip   main connect_ip   '188.114.99.0'
-	config_get connect_port main connect_port 443
-	config_get fake_sni     main fake_sni     'chatgpt.com'
-	config_get interface    main interface    'default'
-	config_get backend      main backend      'auto'
+	config_get enabled        main enabled        0
+	config_get listen_host    main listen_host    '127.0.0.1'
+	config_get listen_port    main listen_port    40443
+	config_get connect_ip     main connect_ip     '188.114.99.0'
+	config_get connect_port   main connect_port   443
+	config_get fake_sni       main fake_sni       'chatgpt.com'
+	config_get interface      main interface      'default'
+	config_get backend        main backend        'auto'
+	config_get bind_interface main bind_interface 0
+
+	[ "$bind_interface" = "1" ] && bind_interface=true || bind_interface=false
 
 	cat > "$CONF_JSON" <<-EOF
 	{
@@ -38,6 +45,7 @@ gen_config() {
 	  "FAKE_SNI": "$fake_sni",
 	  "INTERFACE": "$interface",
 	  "BACKEND": "$backend",
+	  "BIND_INTERFACE": $bind_interface,
 	  "AUTO_SELECT_INTERFACE": true
 	}
 	EOF
@@ -46,15 +54,23 @@ gen_config() {
 }
 
 start_service() {
-	local enabled
+	local enabled no_bpf
 	enabled="$(gen_config)"
+	config_get no_bpf main no_bpf 0
+
 	if [ "$enabled" != "1" ]; then
 		echo "sni-spoof: disabled (set 'enabled 1' in /etc/config/sni-spoof or toggle it in LuCI)"
+		# NB: we still fall through to procd_close_service in rc.common, so the
+		# service object and its reload trigger stay registered. That is what
+		# makes a later LuCI "Save & Apply" able to start us without a reboot.
 		return 0
 	fi
 
 	procd_open_instance
 	procd_set_param command /usr/bin/python3 "$PROG_DIR/main.py"
+	# SNI_NO_BPF is the documented escape hatch for a kernel whose in-kernel BPF
+	# filter drops our packets; without this it was unreachable on OpenWrt.
+	procd_set_param env SNI_NO_BPF="$no_bpf" PYTHONUNBUFFERED=1
 	procd_set_param respawn 3600 5 5      # restart if it dies (threshold, timeout, retries)
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -69,4 +85,147 @@ service_triggers() {
 reload_service() {
 	stop
 	start
+}
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+# Every failure mode this tool has on a router is silent by nature: the relay
+# still accepts connections, it just cannot complete the desync. This walks the
+# chain from "is it even installed" to "does our own traffic reach the wire" and
+# names the first broken link.
+
+_ok()   { echo "  [ OK ] $*"; }
+_warn() { echo "  [WARN] $*"; }
+_bad()  { echo "  [FAIL] $*"; }
+
+check() {
+	local enabled listen_host listen_port connect_ip connect_port interface no_bpf
+	config_load 'sni-spoof'
+	config_get enabled      main enabled      0
+	config_get listen_host  main listen_host  '127.0.0.1'
+	config_get listen_port  main listen_port  40443
+	config_get connect_ip   main connect_ip   '188.114.99.0'
+	config_get connect_port main connect_port 443
+	config_get interface    main interface    'default'
+	config_get no_bpf       main no_bpf       0
+
+	echo "=== SNI-Spoofing diagnostics ==============================="
+	echo
+	echo "Version : $(cat "$PROG_DIR/VERSION" 2>/dev/null || echo unknown)"
+	echo "Config  : $listen_host:$listen_port -> $connect_ip:$connect_port"
+	echo "          interface=$interface  no_bpf=$no_bpf  enabled=$enabled"
+	echo
+
+	echo "-- Runtime -------------------------------------------------"
+	if [ ! -f "$PROG_DIR/main.py" ]; then
+		_bad "$PROG_DIR/main.py is missing — re-run openwrt/install.sh"
+		return 1
+	fi
+	_ok "program installed at $PROG_DIR"
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		_bad "python3 is not installed"
+		return 1
+	fi
+	_ok "python3 present ($(python3 -V 2>&1))"
+
+	local missing=""
+	for m in asyncio concurrent.futures socket struct fcntl ctypes json threading; do
+		python3 -c "import $m" >/dev/null 2>&1 || missing="$missing $m"
+	done
+	if [ -n "$missing" ]; then
+		_bad "missing Python modules:$missing"
+		echo "         The service cannot even start. Install the matching"
+		echo "         python3-* packages (python3-asyncio, python3-ctypes, ...)."
+		return 1
+	fi
+	_ok "all required Python modules importable"
+
+	echo
+	echo "-- Service -------------------------------------------------"
+	[ "$enabled" = "1" ] && _ok "enabled in UCI" || _warn "disabled in UCI (option enabled '0')"
+
+	if [ -f /var/run/sni-spoof.pid ] && kill -0 "$(cat /var/run/sni-spoof.pid)" 2>/dev/null; then
+		_ok "running (pid $(cat /var/run/sni-spoof.pid))"
+	elif pgrep -f "$PROG_DIR/main.py" >/dev/null 2>&1; then
+		_ok "running (pid $(pgrep -f "$PROG_DIR/main.py" | head -1))"
+	else
+		_warn "not running — start it with: /etc/init.d/sni-spoof start"
+	fi
+
+	if netstat -ltn 2>/dev/null | grep -q "[:.]$listen_port[[:space:]]"; then
+		_ok "listening on port $listen_port"
+	else
+		_warn "nothing is listening on port $listen_port"
+		echo "         Your proxy client will get 'connection refused'."
+	fi
+
+	echo
+	echo "-- Network -------------------------------------------------"
+	local src
+	src="$(ip route get "$connect_ip" 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
+	if [ -n "$src" ]; then
+		local dev
+		dev="$(ip route get "$connect_ip" 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)"
+		_ok "route to $connect_ip via $dev (source $src)"
+		if [ "$interface" != "default" ] && [ "$interface" != "$dev" ] \
+		   && [ "$interface" != "$src" ]; then
+			_warn "configured interface '$interface' is not the device the route uses ($dev)"
+			echo "         Set it to 'default', to '$dev', or to '$src'."
+		fi
+	else
+		_bad "no route to $connect_ip"
+	fi
+
+	echo
+	echo "-- Passwall2 / firewall interference -----------------------"
+	# This is the one that actually bites. AF_PACKET taps AFTER nat, so anything
+	# that redirects the relay's own outbound connection makes it invisible to
+	# the injector — the desync then silently never fires.
+	if [ -d /etc/config ] && [ -f /etc/config/passwall2 ]; then
+		_ok "Passwall2 is installed"
+		if uci -q show passwall2 | grep -qF "$connect_ip"; then
+			_ok "$connect_ip appears in the Passwall2 configuration (bypass list?)"
+		else
+			_warn "$connect_ip is NOT mentioned anywhere in the Passwall2 config"
+			echo "         The relay's own connection to the server will be re-proxied,"
+			echo "         which breaks the desync. Add it to the direct/bypass list:"
+			echo "           uci add_list passwall2.@global[0].direct_ip=$connect_ip"
+			echo "           uci commit passwall2 && /etc/init.d/passwall2 restart"
+		fi
+	else
+		echo "  [ -- ] Passwall2 not installed"
+	fi
+
+	if command -v nft >/dev/null 2>&1; then
+		local redirects
+		redirects="$(nft list ruleset 2>/dev/null \
+			| awk '/hook output/,/^[[:space:]]*}/' \
+			| grep -ciE 'redirect|tproxy|dnat' 2>/dev/null)"
+		if [ "${redirects:-0}" -gt 0 ]; then
+			_warn "$redirects redirect/tproxy/dnat rule(s) in an output hook"
+			echo "         Something rewrites this router's own outgoing connections."
+			echo "         If $connect_ip is not exempted, the desync cannot work."
+		else
+			_ok "no redirect/tproxy/dnat rules in any output hook"
+		fi
+	fi
+
+	echo
+	echo "-- Live wire test ------------------------------------------"
+	if [ -f "$PROG_DIR/selftest.py" ]; then
+		# selftest.py reads the generated config.json. Refresh it first so the
+		# test still works when the service has never been started.
+		gen_config >/dev/null 2>&1
+		python3 "$PROG_DIR/selftest.py"
+	else
+		_warn "selftest.py not installed — re-run openwrt/install.sh for the wire test"
+	fi
+
+	echo
+	echo "-- Recent log ----------------------------------------------"
+	logread -e sni-spoof 2>/dev/null | tail -20 || echo "  (no log entries)"
+	echo
+	echo "============================================================"
 }

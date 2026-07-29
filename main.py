@@ -28,6 +28,15 @@ def get_exe_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_version() -> str:
+    """The installed release tag, from the VERSION file next to this script."""
+    try:
+        with open(os.path.join(get_exe_dir(), "VERSION")) as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
 DEFAULT_CONFIG = {
     "LISTEN_HOST": "0.0.0.0",
     "LISTEN_PORT": 40443,
@@ -41,10 +50,17 @@ DEFAULT_CONFIG = {
     # interactive interface menu and use the default-route interface. Handy for
     # headless boxes and OpenWRT.
     "AUTO_SELECT_INTERFACE": False,
-    # Pin the outbound interface by name (e.g. "wan") or by IPv4. Empty or "default"
-    # = pick the default-route interface automatically. This is what the OpenWRT /
-    # LuCI interface selector sets; it works on every platform.
+    # Pin the outbound interface by *kernel device* name (e.g. "pppoe-wan",
+    # "eth0.2") or by IPv4. Note this is not the OpenWRT/UCI logical name: "wan"
+    # is a logical interface, and on DSA targets it is also a switch port with no
+    # IPv4 of its own — pinning it would leave the injector with nothing to bind.
+    # Empty or "default" = follow the default route automatically (recommended).
     "INTERFACE": "",
+    # Bind the capture socket to the outbound interface instead of listening on
+    # all of them. Off by default: binding by name has proved unreliable on some
+    # virtualised NICs. Duplicate frames from a stacked WAN are handled without
+    # it, so turn this on only to shave CPU on a very busy router.
+    "BIND_INTERFACE": False,
 }
 
 
@@ -77,6 +93,7 @@ if not BACKEND or BACKEND == "auto":
     BACKEND = detect_backend()
 AUTO_SELECT_INTERFACE = bool(config.get("AUTO_SELECT_INTERFACE", False))
 CONFIG_INTERFACE = str(config.get("INTERFACE", "") or "").strip()
+BIND_INTERFACE = bool(config.get("BIND_INTERFACE", False))
 INTERFACE_IPV4 = get_default_interface_ipv4(CONNECT_IP)
 
 
@@ -130,6 +147,13 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
     print(f"[+] Client connected: {conn_id}")
     try:
         loop = asyncio.get_running_loop()
+        if not INTERFACE_IPV4:
+            # Binding to 0.0.0.0 would make the connection's source address
+            # unknowable, so the injector could never match it and the client
+            # would just stall for 2s. Fail fast and say why instead.
+            report_no_bind_ip(conn_id)
+            incoming_sock.close()
+            return
         if DATA_MODE == "tls":
             fake_data = ClientHelloMaker.get_client_hello_with(os.urandom(32), os.urandom(32), FAKE_SNI,
                                                                os.urandom(32))
@@ -156,16 +180,21 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
             if BYPASS_METHOD == "wrong_seq":
                 try:
                     await asyncio.wait_for(fake_injective_conn.t2a_event.wait(), 2)
-                    if fake_injective_conn.t2a_msg == "unexpected_close":
-                        raise ValueError("unexpected close")
-                    if fake_injective_conn.t2a_msg == "fake_data_ack_recv":
-                        pass
-                    else:
-                        sys.exit("impossible t2a msg!")
+                except asyncio.TimeoutError:
+                    report_desync_timeout(fake_injective_conn, conn_id)
+                    outgoing_sock.close()
+                    incoming_sock.close()
+                    return
                 except Exception:
                     outgoing_sock.close()
                     incoming_sock.close()
                     return
+                if fake_injective_conn.t2a_msg == "unexpected_close":
+                    outgoing_sock.close()
+                    incoming_sock.close()
+                    return
+                if fake_injective_conn.t2a_msg != "fake_data_ack_recv":
+                    sys.exit("impossible t2a msg!")
             else:
                 sys.exit("unknown bypass method!")
         finally:
@@ -181,6 +210,69 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         sys.exit("handle should not raise exception")
     finally:
         print(f"[-] Client disconnected: {conn_id}")
+
+
+_last_timeout_report = 0.0
+_last_nobind_report = 0.0
+
+
+def report_no_bind_ip(conn_id: str):
+    """Explain that there is no outbound address to work with. Rate-limited."""
+    global _last_nobind_report
+    now = time.monotonic()
+    if now - _last_nobind_report < 10:
+        return
+    _last_nobind_report = now
+    print(f"[Error] {conn_id}: refused — no outbound IPv4 address is available.")
+    print(f"        Configured INTERFACE={CONFIG_INTERFACE or 'default'}. Either the WAN is "
+          f"down, or INTERFACE names a device that has no IPv4.")
+    print(f"        It must be a kernel device name ('pppoe-wan', 'eth0.2', ...), an IPv4, "
+          f"or 'default'. On OpenWRT run: /etc/init.d/sni-spoof check")
+
+
+def report_desync_timeout(conn, conn_id: str):
+    """Explain a desync timeout instead of dropping the client in silence.
+
+    The relay gives the injector 2 s to confirm the fake ClientHello was
+    acknowledged; if it never is, the client connection is closed and — before
+    this — nothing said why. Each milestone that was *not* reached points at a
+    different cause, so report the first one missing. Rate-limited, because a
+    broken setup fails on every single connection and this goes to syslog.
+    """
+    global _last_timeout_report
+    now = time.monotonic()
+    if now - _last_timeout_report < 10:
+        return
+    _last_timeout_report = now
+
+    print(f"[Error] {conn_id}: desync timed out after 2s; dropping the connection.")
+    if fake_tcp_injector is None:
+        print(f"        The packet injector is NOT running — nothing is watching the wire.")
+        print(f"        Usually the outbound interface has no IPv4 yet. Configured "
+              f"INTERFACE={CONFIG_INTERFACE or 'default'}; current bind IP="
+              f"{INTERFACE_IPV4 or '(none)'}.")
+        return
+
+    if conn.syn_seq == -1:
+        print(f"        No outbound SYN to {CONNECT_IP}:{CONNECT_PORT} was ever seen on the wire.")
+        print(f"        The connection left the box without dst={CONNECT_IP}, so something "
+              f"redirected it before egress.")
+        print(f"        On OpenWRT with Passwall2 this is the usual cause: Passwall2's nat/mangle "
+              f"OUTPUT rules re-proxy the router's own traffic.")
+        print(f"        Fix: add {CONNECT_IP} to Passwall2's direct/bypass list so the relay's "
+              f"own outbound connection is left alone.")
+        print(f"        Check with: /etc/init.d/sni-spoof check")
+    elif conn.syn_ack_seq == -1:
+        print(f"        SYN was sent but {CONNECT_IP}:{CONNECT_PORT} never answered with SYN-ACK.")
+        print(f"        The server is unreachable or filtered — this is not a desync problem.")
+    elif not conn.fake_sent:
+        print(f"        Handshake completed but the fake ClientHello was never injected.")
+        print(f"        Raw-socket injection is failing; check that the service runs as root.")
+    else:
+        print(f"        Fake ClientHello was injected but never acknowledged by the server.")
+        print(f"        It was likely dropped in transit — by conntrack marking it INVALID, or "
+              f"by the DPI itself.")
+        print(f"        Try SNI_NO_BPF=1 (UCI option 'no_bpf 1') to rule out the kernel filter.")
 
 
 def _set_keepalive(sock: socket.socket):
@@ -213,12 +305,39 @@ async def main():
         asyncio.create_task(handle(incoming_sock, addr))
 
 
-def select_network_interface() -> "tuple[str, str]":
-    """Return (interface_name, ipv4). Portable across Windows / Linux / macOS.
+def resolve_bind_ip() -> str:
+    """The IPv4 the relay should bind and inject on *right now*, or '' if none.
 
-    Non-interactive (AUTO_SELECT_INTERFACE, or no TTY) picks the default-route
-    interface so the tool works headless and under init systems / OpenWRT procd.
+    Re-resolved on every poll rather than latched at startup. That matters under
+    procd: START=95 can easily run before DHCP finishes or PPPoE dials, and the
+    previous behaviour latched a placeholder name that no device would ever
+    match, leaving the injector permanently unstarted after a reboot.
+
+    Honours the pinned INTERFACE setting: an IPv4 literal is used verbatim, a
+    device name is looked up fresh each call (so an interface appearing late,
+    like pppoe-wan, self-heals), and empty/"default" follows the default route.
     """
+    if CONFIG_INTERFACE and CONFIG_INTERFACE.lower() != "default":
+        if _looks_like_ipv4(CONFIG_INTERFACE):
+            return CONFIG_INTERFACE
+        ip = ip_for_ifname(CONFIG_INTERFACE)
+    else:
+        ip = get_default_interface_ipv4(CONNECT_IP) or default_route_ip(CONNECT_IP)
+    # A link-local address means DHCP failed; binding to it cannot reach anything.
+    return "" if not ip or ip.startswith("169.254") else ip
+
+
+def select_network_interface() -> "tuple[str, str]":
+    """Return (label, ipv4). Portable across Windows / Linux / macOS.
+
+    The label is for display only — the *binding* IP is always re-derived by
+    ``resolve_bind_ip()``, so a stale or unresolvable name can no longer wedge
+    the injector.
+
+    Non-interactive (AUTO_SELECT_INTERFACE, or no TTY) follows the default route
+    so the tool works headless and under init systems / OpenWRT procd.
+    """
+    global CONFIG_INTERFACE
     default_ip = get_default_interface_ipv4(CONNECT_IP) or default_route_ip(CONNECT_IP)
     interfaces = list_interfaces()
 
@@ -231,22 +350,26 @@ def select_network_interface() -> "tuple[str, str]":
     # A pinned interface (from config / the LuCI selector) wins on every platform.
     # Empty or "default" means auto default-route.
     if CONFIG_INTERFACE and CONFIG_INTERFACE.lower() != "default":
+        ip = resolve_bind_ip()
         if _looks_like_ipv4(CONFIG_INTERFACE):
-            name = name_for(CONFIG_INTERFACE) or "manual"
-            print(f"[Info] Using configured interface IP {CONFIG_INTERFACE} ({name})")
-            return name, CONFIG_INTERFACE
-        ip = ip_for_ifname(CONFIG_INTERFACE)
+            print(f"[Info] Using configured interface IP {CONFIG_INTERFACE} "
+                  f"({name_for(CONFIG_INTERFACE) or 'not owned by any local device'})")
+            return f"IP {CONFIG_INTERFACE}", ip
         if ip:
             print(f"[Info] Using configured interface {CONFIG_INTERFACE} ({ip})")
         else:
-            print(f"[Info] Configured interface {CONFIG_INTERFACE} has no IPv4 yet; "
-                  f"waiting for it to come up")
+            have = ", ".join(f"{i.get('name')}={i.get('ip')}" for i in interfaces) or "none"
+            print(f"[Warning] Configured interface {CONFIG_INTERFACE!r} has no IPv4. "
+                  f"Waiting for it to come up.")
+            print(f"[Warning] INTERFACE must be a kernel device name, not an OpenWRT logical "
+                  f"name: use 'pppoe-wan' / 'eth0.2' / ... , an IPv4, or 'default'.")
+            print(f"[Warning] Devices that do have an IPv4: {have}")
         return CONFIG_INTERFACE, ip
 
     non_interactive = AUTO_SELECT_INTERFACE or not sys.stdin or not sys.stdin.isatty()
     if non_interactive or not interfaces:
-        name = name_for(default_ip) or "default"
-        print(f"[Info] Using interface {name} ({default_ip})")
+        name = name_for(default_ip) or "default route"
+        print(f"[Info] Following the default route: {name} ({default_ip or 'no IPv4 yet'})")
         return name, default_ip
 
     print("\n==================================================")
@@ -263,12 +386,14 @@ def select_network_interface() -> "tuple[str, str]":
         except EOFError:
             choice = ""
         if not choice:
-            name = name_for(default_ip) or "default"
+            name = name_for(default_ip) or "default route"
             print(f"Using interface: {name} ({default_ip})")
             return name, default_ip
         if choice.isdigit() and 1 <= int(choice) <= len(interfaces):
             sel = interfaces[int(choice) - 1]
             print(f"Using interface: {sel.get('name')} ({sel.get('ip')})")
+            # Pin the choice so resolve_bind_ip() keeps tracking this device.
+            CONFIG_INTERFACE = sel.get("name", "")
             return sel.get("name", ""), sel.get("ip", "")
         print("Invalid selection.")
 
@@ -277,14 +402,24 @@ fake_tcp_injector = None
 injector_thread = None
 
 
+def injector_running() -> bool:
+    """True when the capture/inject thread is alive and watching the wire."""
+    return fake_tcp_injector is not None and injector_thread is not None \
+        and injector_thread.is_alive()
+
+
 def run_injector_safe(local_ip: str):
     global fake_tcp_injector
     try:
-        engine = create_engine(local_ip, CONNECT_IP, CONNECT_PORT, backend=BACKEND)
+        engine = create_engine(local_ip, CONNECT_IP, CONNECT_PORT, backend=BACKEND,
+                               bind_interface=BIND_INTERFACE)
         fake_tcp_injector = FakeTcpInjector(engine, fake_injective_connections)
         fake_tcp_injector.run()
     except Exception as e:
-        print(f"\n[Info] Injector stopped: {e}")
+        print(f"\n[Error] Injector stopped: {e}")
+        traceback.print_exc()
+    finally:
+        fake_tcp_injector = None
 
 
 def stop_injector():
@@ -299,49 +434,74 @@ def stop_injector():
 
 def start_injector(local_ip: str):
     global injector_thread
-    print(f"\n[Info] Starting fake-TCP injector ({BACKEND} backend) on {local_ip} "
+    print(f"[Info] Starting fake-TCP injector ({BACKEND} backend) on {local_ip} "
           f"-> {CONNECT_IP}:{CONNECT_PORT}")
     injector_thread = threading.Thread(target=run_injector_safe, args=(local_ip,), daemon=True)
     injector_thread.start()
 
 
-def monitor_adapter_loop(adapter_name: str, initial_ip: str):
-    """Watch the chosen adapter's IPv4 and rebind the injector when it changes."""
+def monitor_adapter_loop(label: str, initial_ip: str):
+    """Keep the injector bound to the current outbound IPv4.
+
+    ``label`` is only for log messages; the address is re-derived every tick by
+    ``resolve_bind_ip()`` so a WAN that comes up late, changes address, or drops
+    and returns is all handled by the same path.
+    """
     global INTERFACE_IPV4
     last_ip = initial_ip
+    last_warn = 0.0
+    last_restart = 0.0
 
     if last_ip:
+        INTERFACE_IPV4 = last_ip
         start_injector(last_ip)
     else:
-        print(f"\n[Warning] Adapter '{adapter_name}' has no IP yet. Waiting...")
+        print(f"[Warning] {label} has no IPv4 yet — waiting for it before starting the injector.")
 
     while True:
         time.sleep(2)
-        current_ip = ""
         try:
-            for i in list_interfaces():
-                if i.get("name") == adapter_name:
-                    ip = i.get("ip", "")
-                    if ip and not ip.startswith("169.254"):
-                        current_ip = ip
-                        break
+            current_ip = resolve_bind_ip()
         except Exception:
-            pass
+            current_ip = ""
 
         if last_ip and not current_ip:
-            print(f"\n[Warning] Adapter '{adapter_name}' disconnected. Pausing tunnel...")
+            print(f"[Warning] {label} lost its IPv4. Pausing the injector...")
             stop_injector()
             last_ip = ""
             INTERFACE_IPV4 = ""
         elif current_ip and current_ip != last_ip:
             if not last_ip:
-                print(f"\n[Info] Adapter '{adapter_name}' up (IP: {current_ip}). Resuming...")
+                print(f"[Info] {label} is up (IPv4: {current_ip}). Resuming...")
             else:
-                print(f"\n[Info] Adapter '{adapter_name}' IP changed {last_ip} -> {current_ip}. Rebinding...")
+                print(f"[Info] {label} IPv4 changed {last_ip} -> {current_ip}. Rebinding...")
                 stop_injector()
             INTERFACE_IPV4 = current_ip
             last_ip = current_ip
             start_injector(current_ip)
+        elif not current_ip:
+            # Nag periodically: without an IPv4 nothing can work, and a silent
+            # wait here is exactly what made this state so hard to diagnose.
+            now = time.monotonic()
+            if now - last_warn > 30:
+                last_warn = now
+                try:
+                    have = ", ".join(f"{i.get('name')}={i.get('ip')}"
+                                     for i in list_interfaces()) or "none"
+                except Exception:
+                    have = "unknown"
+                print(f"[Warning] Still no IPv4 for {label}; the desync cannot run. "
+                      f"Devices with an IPv4: {have}")
+        elif not injector_running():
+            # The capture thread died (e.g. the socket was closed underneath it)
+            # but the address is still fine — bring it back. Backed off, because
+            # a permanent failure (not root, no AF_PACKET) would otherwise spin.
+            now = time.monotonic()
+            if now - last_restart > 10:
+                last_restart = now
+                print(f"[Warning] Injector is not running; restarting it on {current_ip}.")
+                stop_injector()
+                start_injector(current_ip)
 
 
 if __name__ == "__main__":
@@ -349,7 +509,7 @@ if __name__ == "__main__":
         print("This program requires root/administrator privileges. Attempting to elevate...")
         elevate_or_exit()
 
-    print(f"[Info] Platform backend: {BACKEND}")
+    print(f"[Info] SNI-Spoofing {get_version()} — platform backend: {BACKEND}")
 
     INTERFACE_NAME, INTERFACE_IPV4 = select_network_interface()
 

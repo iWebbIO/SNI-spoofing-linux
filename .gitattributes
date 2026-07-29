@@ -1,0 +1,10 @@
+# These files are executed by BusyBox ash on the router. A CRLF line ending
+# makes the shebang line `#!/bin/sh\r` unresolvable and every command fail with
+# a confusing "not found", so pin them to LF regardless of the platform they are
+# edited on. (Python and JS tolerate CRLF, so they are deliberately not listed —
+# no need to renormalize files that work either way.)
+*.sh                                                text eol=lf
+openwrt/sni-spoof.init                              text eol=lf
+openwrt/config/*                                    text eol=lf
+openwrt/luci-app-sni-spoof/root/usr/libexec/rpcd/*  text eol=lf
+VERSION                                             text eol=lf

@@ -60,18 +60,26 @@ utils/rawpacket.py ── pure-Python IPv4/TCP parse+build (pydivert-compatible)
   "FAKE_SNI": "chatgpt.com",
   "INTERFACE": "",
   "BACKEND": "auto",
-  "AUTO_SELECT_INTERFACE": false
+  "AUTO_SELECT_INTERFACE": false,
+  "BIND_INTERFACE": false
 }
 ```
 
 - `CONNECT_IP` — the real IP you want to reach (e.g. a Cloudflare edge IP).
 - `FAKE_SNI` — the decoy hostname shown to the DPI.
-- `INTERFACE` — pin the outbound interface by name (e.g. `wan`) or by IPv4.
-  Empty or `"default"` = follow the default route automatically. On desktop this
-  is offered as an interactive menu; on OpenWRT it is the LuCI dropdown.
+- `INTERFACE` — pin the outbound interface by **kernel device name** or by IPv4.
+  Empty or `"default"` = follow the default route automatically (recommended).
+  On desktop this is offered as an interactive menu; on OpenWRT it is the LuCI
+  dropdown. **On OpenWRT this is a device name, not a UCI logical name**: use
+  `pppoe-wan` / `eth0.2` / `eth1`, not `wan`. On DSA targets a device called
+  `wan` does exist but is a switch port with no address of its own, so pinning
+  it leaves the relay with nothing to bind to.
 - `BACKEND` — `auto` (recommended), or force `windivert` / `raw` / `scapy`.
 - `AUTO_SELECT_INTERFACE` — `true` to skip the interactive interface menu (also
   auto-skipped whenever stdin is not a TTY, e.g. under systemd/procd).
+- `BIND_INTERFACE` — Linux only; bind packet capture to the outbound device
+  instead of listening on all of them. Off by default (binding by name is
+  unreliable on some virtual NICs) and rarely needed.
 
 It is created with defaults on first run.
 
@@ -138,10 +146,16 @@ sh openwrt/install.sh
 ```
 
 The installer:
-- installs the Python runtime (`apk` on OpenWrt 24.10+, `opkg` on older builds);
+- installs the Python runtime (`apk` on OpenWrt 24.10+, `opkg` on older builds),
+  one package at a time, then **verifies every module the program imports** —
+  a missing `python3-*` package would otherwise leave the service crash-looping
+  with nothing listening;
 - copies the program to `/opt/sni-spoof`;
-- installs a UCI config at `/etc/config/sni-spoof` and a procd service;
-- installs a minimal **LuCI** page under **Services → SNI Spoofing** (if LuCI is present).
+- installs a UCI config at `/etc/config/sni-spoof` and a procd service, and
+  **starts it** so procd registers the reload trigger — without that, toggling
+  *Enabled* in LuCI would commit the config and then do nothing until a reboot;
+- installs a minimal **LuCI** page under **Services → SNI Spoofing** (if LuCI is
+  present), including status, diagnostics and a GitHub update button.
 
 ### Configure
 
@@ -155,12 +169,20 @@ config sni-spoof 'main'
 	option connect_ip   '<your server IP>'
 	option connect_port '443'
 	option fake_sni     'chatgpt.com'
-	option interface    'default'      # or pin one, e.g. 'wan'
+	option interface    'default'      # recommended; see below before pinning
+	option no_bpf       '0'
 ```
 
 The LuCI page shows **Network interface** as a dropdown — **Default (default
-route)** plus every device on the router. Pick `wan` to force egress out the WAN,
-or leave it on Default.
+route)** plus every device on the router. Leave it on **Default** unless you have
+a specific reason not to.
+
+> **Do not pin `wan`.** That is a UCI *logical* interface name, and this setting
+> takes a *kernel device* name. On DSA targets `wan` is also a real device — a
+> switch port with no IPv4 of its own — so pinning it leaves the relay with no
+> address to bind and the injector never starts. If you must pin, use the device
+> that actually holds the WAN address (`pppoe-wan`, `eth0.2`, `eth1`, …) or the
+> IPv4 itself. `ip route get <your server IP>` names the right one.
 
 `Save & Apply` (or `uci commit sni-spoof`) regenerates `config.json` and restarts
 the relay via the procd reload trigger. CLI equivalents:
@@ -168,6 +190,7 @@ the relay via the procd reload trigger. CLI equivalents:
 ```sh
 /etc/init.d/sni-spoof enable      # start on boot
 /etc/init.d/sni-spoof start
+/etc/init.d/sni-spoof check       # diagnose — run this first if it misbehaves
 logread -e sni-spoof              # watch output
 ```
 
@@ -185,8 +208,58 @@ firewall. To route a Passwall2 node through it:
 2. In Passwall2, edit your node and set its **address/port to `127.0.0.1` : `40443`**
    (the relay's listen address). Passwall speaks its normal protocol *through* the
    relay; the relay injects the fake SNI on the wire.
-3. **Add `connect_ip` to Passwall2's direct/bypass list** so Passwall does not
-   re-proxy the relay's own outbound connection (which would loop).
+3. **Add `connect_ip` to Passwall2's direct/bypass list.** This step is not
+   optional and is the single most common reason the OpenWRT setup appears not
+   to work at all.
+
+```sh
+uci add_list passwall2.@global[0].direct_ip='<your server IP>'
+uci commit passwall2 && /etc/init.d/passwall2 restart
+```
+
+(Option names differ between Passwall2 versions; the goal is simply that this one
+IP is always routed **direct**, never through a node.)
+
+#### Why step 3 is mandatory
+
+Passwall2 installs `nat OUTPUT` / `mangle OUTPUT` rules that capture the
+*router's own* outgoing connections. The relay's connection to your server is
+router-originated, so it gets captured too.
+
+The relay observes that connection with an `AF_PACKET` socket, and `AF_PACKET`
+taps the egress path **after** NAT. So once Passwall2 redirects the connection,
+the packets that actually reach the wire no longer carry your server's address.
+The injector sees nothing, the fake ClientHello is never sent, and after two
+seconds the relay gives up and closes the connection. From Passwall2's side this
+looks like "the node just doesn't connect", with nothing in any log to explain it.
+
+This is also the one failure mode Windows cannot reproduce: WinDivert hooks the
+network layer *before* NAT, and there is no Passwall2 in the picture.
+
+To confirm which side of this you are on:
+
+```sh
+/etc/init.d/sni-spoof check
+```
+
+It makes one real connection to your server while watching the wire and tells you
+whether the packets got out — plus it checks the Python runtime, the service, the
+route, and whether `connect_ip` appears anywhere in your Passwall2 config.
+
+### Updating
+
+The LuCI page has a **Status & Maintenance** panel with **Check for updates** and
+**Update now**, which pull the latest GitHub release, reinstall, and restart the
+service. The previous install is backed up first and restored automatically if
+anything fails. The same thing from the shell:
+
+```sh
+/opt/sni-spoof/update.sh check     # installed vs latest release
+/opt/sni-spoof/update.sh apply     # download, install, restart
+```
+
+The source repository is read from UCI (`sni-spoof.update.repo`), never from the
+web request, so the download URL cannot be steered from the browser.
 
 ### Why it is non-invasive on a router (fw4 / conntrack)
 
@@ -206,9 +279,37 @@ fw4. (Reproduce with `sudo python3 tests/net_e2e_fw4.py`.)
   zero even on a busy WAN link.
 - No packets are dropped or rewritten in the kernel path; the tool only *sniffs*
   and injects one extra packet, so it adds no forwarding latency.
-- If a particular kernel's BPF ever misbehaves, set `SNI_NO_BPF=1` to skip the
-  kernel filter and rely on the pure-Python pre-filter alone — guaranteed correct,
+- If a particular kernel's BPF ever misbehaves, set `SNI_NO_BPF=1` (or
+  `option no_bpf '1'` in UCI, which the LuCI page also exposes) to skip the
+  kernel filter and rely on the pure-Python filter alone — guaranteed correct,
   just higher CPU. (Verified: the end-to-end desync passes with BPF on *and* off.)
+
+### Capture parity with the Windows engine
+
+The desync state machine is shared across platforms and was written against
+WinDivert's capture filter, which delivers only *control* packets of one
+specific flow:
+
+```
+tcp and ((SrcAddr == local_ip and DstAddr == server and DstPort == port) or
+         (SrcAddr == server and DstAddr == local_ip and SrcPort == port))
+    and (tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength == 0)
+```
+
+The Linux engine reproduces every clause — the in-kernel BPF pins the address
+pair, and `recv()` applies the port and payload clauses. This matters: the state
+machine has no branch for a payload-bearing packet, so one reaching it is treated
+as a protocol violation and the connection is torn down.
+
+Two things WinDivert provides for free that a sniffer must emulate, and now does:
+
+- WinDivert *removes* a packet from the stack, so it is seen exactly once. An
+  `AF_PACKET` socket sees one copy **per netdev in the egress stack** — and on a
+  router the WAN path is routinely stacked (`pppoe-wan` over `eth0.2` over
+  `eth0`, or a DSA user port over its conduit). Exact duplicates are collapsed.
+- A WinDivert-injected packet never comes back; a raw-injected one is tapped on
+  egress like any other, once per netdev. Every echo is absorbed, not just the
+  first.
 
 ---
 
@@ -242,6 +343,14 @@ sudo python3 tests/net_e2e.py
 
 # end-to-end desync THROUGH an fw4-style conntrack INVALID-drop rule (root):
 sudo python3 tests/net_e2e_fw4.py
+```
+
+On a router, the most useful check is not a test but the built-in diagnostic —
+it inspects the live installation and makes one real connection while watching
+the wire:
+
+```sh
+/etc/init.d/sni-spoof check
 ```
 
 The end-to-end test proves the real behaviour: the peer receives the genuine

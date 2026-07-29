@@ -1,11 +1,17 @@
 {
 	"luci-app-sni-spoof": {
-		"description": "Grant access to SNI Spoofing configuration",
+		"description": "Grant access to SNI Spoofing configuration, status and updates",
 		"read": {
-			"uci": [ "sni-spoof" ]
+			"uci": [ "sni-spoof" ],
+			"ubus": {
+				"luci.sni-spoof": [ "status", "check_update", "update_status", "diagnose", "logs" ]
+			}
 		},
 		"write": {
-			"uci": [ "sni-spoof" ]
+			"uci": [ "sni-spoof" ],
+			"ubus": {
+				"luci.sni-spoof": [ "update" ]
+			}
 		}
 	}
 }

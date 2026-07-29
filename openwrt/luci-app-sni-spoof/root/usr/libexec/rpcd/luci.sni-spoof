@@ -1,0 +1,155 @@
+#!/bin/sh
+# rpcd backend for luci-app-sni-spoof.
+#
+# Exposes status, diagnostics and the GitHub updater to the LuCI page. Access is
+# gated by /usr/share/rpcd/acl.d/luci-app-sni-spoof.json.
+#
+# The update runs detached and is polled, rather than being done inline: pulling
+# a release over a router's WAN routinely takes longer than the ubus request
+# timeout, and a request that dies mid-install is exactly what must not happen.
+
+. /usr/share/libubox/jshn.sh
+
+PROG_DIR=/opt/sni-spoof
+UPDATE_SH="$PROG_DIR/update.sh"
+UPDATE_LOG=/tmp/sni-spoof-update.log
+UPDATE_PID=/tmp/sni-spoof-update.pid
+
+svc_running() {
+	if [ -f /var/run/sni-spoof.pid ] && kill -0 "$(cat /var/run/sni-spoof.pid)" 2>/dev/null; then
+		return 0
+	fi
+	pgrep -f "$PROG_DIR/main.py" >/dev/null 2>&1
+}
+
+update_running() {
+	[ -f "$UPDATE_PID" ] && kill -0 "$(cat "$UPDATE_PID")" 2>/dev/null
+}
+
+method_status() {
+	local port version enabled listen_host connect_ip last_err
+
+	version="$(cat "$PROG_DIR/VERSION" 2>/dev/null || echo unknown)"
+	enabled="$(uci -q get sni-spoof.main.enabled || echo 0)"
+	listen_host="$(uci -q get sni-spoof.main.listen_host || echo 127.0.0.1)"
+	port="$(uci -q get sni-spoof.main.listen_port || echo 40443)"
+	connect_ip="$(uci -q get sni-spoof.main.connect_ip)"
+
+	# Surface the most recent actionable line from the log. Every failure mode
+	# this tool has is silent on the wire, so this is usually the only clue the
+	# user would otherwise have to go hunting for in logread.
+	last_err="$(logread -e sni-spoof 2>/dev/null | grep -E '\[(Error|Warning)\]' \
+		| tail -1 | sed 's/^.*sni-spoof[^ ]* //')"
+
+	json_init
+	json_add_string version "$version"
+	json_add_boolean enabled "$([ "$enabled" = "1" ] && echo 1 || echo 0)"
+	json_add_boolean running "$(svc_running && echo 1 || echo 0)"
+	json_add_boolean listening "$(netstat -ltn 2>/dev/null \
+		| grep -q "[:.]$port[[:space:]]" && echo 1 || echo 0)"
+	json_add_boolean updating "$(update_running && echo 1 || echo 0)"
+	json_add_string listen "$listen_host:$port"
+	json_add_string connect_ip "$connect_ip"
+	json_add_string last_message "$last_err"
+	json_dump
+}
+
+method_check_update() {
+	local out
+	out="$("$UPDATE_SH" check 2>/dev/null)"
+	# update.sh already emits JSON; pass it straight through when it looks sane.
+	case "$out" in
+		\{*\}) echo "$out" ;;
+		*)
+			json_init
+			json_add_string installed "$(cat "$PROG_DIR/VERSION" 2>/dev/null || echo unknown)"
+			json_add_string latest ""
+			json_add_boolean update_available 0
+			json_add_string error "Could not query GitHub. Check the router's DNS and internet access."
+			json_dump
+			;;
+	esac
+}
+
+method_update() {
+	if update_running; then
+		json_init
+		json_add_boolean started 0
+		json_add_string error "An update is already running."
+		json_dump
+		return
+	fi
+	if [ ! -x "$UPDATE_SH" ]; then
+		json_init
+		json_add_boolean started 0
+		json_add_string error "$UPDATE_SH is missing. Re-run openwrt/install.sh."
+		json_dump
+		return
+	fi
+
+	rm -f "$UPDATE_LOG"
+	echo "[*] Starting update..." > "$UPDATE_LOG"
+	# Detached, with its own pidfile, so it outlives this ubus request.
+	start-stop-daemon -S -b -m -p "$UPDATE_PID" -x /bin/sh -- "$UPDATE_SH" apply
+
+	json_init
+	json_add_boolean started 1
+	json_dump
+}
+
+method_update_status() {
+	local log finished success
+
+	log="$(cat "$UPDATE_LOG" 2>/dev/null)"
+	# update.sh appends a final "EXIT:<rc>" line; its presence means it is done.
+	grep -q '^EXIT:'  "$UPDATE_LOG" 2>/dev/null && finished=1 || finished=0
+	grep -q '^EXIT:0$' "$UPDATE_LOG" 2>/dev/null && success=1  || success=0
+
+	json_init
+	json_add_boolean running "$(update_running && echo 1 || echo 0)"
+	json_add_boolean finished "$finished"
+	json_add_boolean success "$success"
+	json_add_string version "$(cat "$PROG_DIR/VERSION" 2>/dev/null || echo unknown)"
+	json_add_string log "$log"
+	json_dump
+}
+
+method_diagnose() {
+	local out
+	out="$(/etc/init.d/sni-spoof check 2>&1)"
+	json_init
+	json_add_string report "$out"
+	json_dump
+}
+
+method_logs() {
+	local out
+	out="$(logread -e sni-spoof 2>/dev/null | tail -100)"
+	json_init
+	json_add_string log "$out"
+	json_dump
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "status";        json_close_object
+		json_add_object "check_update";  json_close_object
+		json_add_object "update";        json_close_object
+		json_add_object "update_status"; json_close_object
+		json_add_object "diagnose";      json_close_object
+		json_add_object "logs";          json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			status)        method_status ;;
+			check_update)  method_check_update ;;
+			update)        method_update ;;
+			update_status) method_update_status ;;
+			diagnose)      method_diagnose ;;
+			logs)          method_logs ;;
+			*)             echo '{}' ;;
+		esac
+		;;
+esac

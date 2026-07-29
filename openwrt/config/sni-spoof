@@ -6,13 +6,33 @@ config sni-spoof 'main'
 	option listen_host '127.0.0.1'
 	option listen_port '40443'
 	# The REAL destination the relay connects to (your proxy server's IP).
-	# Add this IP to Passwall2's direct/bypass list so Passwall does not re-proxy it.
+	# Add this IP to Passwall2's direct/bypass list so Passwall does not re-proxy
+	# it. This is NOT optional: if Passwall2 redirects the relay's own outbound
+	# connection, it never reaches the wire with this destination, the injector
+	# never sees it, and every connection dies after 2s. Run
+	# `/etc/init.d/sni-spoof check` to have that verified for you.
 	option connect_ip '188.114.99.0'
 	option connect_port '443'
 	# The allowed hostname DPI will see in the injected fake ClientHello.
 	option fake_sni 'chatgpt.com'
-	# Outbound interface: 'default' = the default-route interface (automatic),
-	# or pin one by name (e.g. 'wan'). The LuCI selector writes this.
+	# Outbound interface. 'default' follows the default route and is what you
+	# want in almost every case. To pin one, use the KERNEL DEVICE name that
+	# actually owns the WAN IPv4 ('pppoe-wan', 'eth0.2', 'eth1', ...) or an IPv4
+	# literal — NOT the UCI logical name 'wan', which on DSA targets is a switch
+	# port with no address of its own and would leave the injector unable to bind.
 	option interface 'default'
 	# Packet engine: 'auto' picks the raw-socket engine on Linux/OpenWrt.
 	option backend 'auto'
+	# Skip the in-kernel BPF capture filter and rely on the Python filter alone.
+	# Slightly higher CPU, but immune to a kernel whose BPF drops our packets.
+	# Worth trying if the log says no outbound SYN was ever observed.
+	option no_bpf '0'
+	# Bind packet capture to the outbound device instead of listening on all of
+	# them. Off by default: binding by name is unreliable on some virtual NICs.
+	option bind_interface '0'
+
+# Where the LuCI "Update" button pulls releases from. Kept in UCI (never taken
+# from the browser) so the download URL cannot be influenced by a web request.
+config update 'update'
+	option repo 'iWebbIO/SNI-spoofing-anywhere'
+	option channel 'release'
