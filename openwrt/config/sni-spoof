@@ -30,6 +30,13 @@ config sni-spoof 'main'
 	# Bind packet capture to the outbound device instead of listening on all of
 	# them. Off by default: binding by name is unreliable on some virtual NICs.
 	option bind_interface '0'
+	# Linux fwmark (SO_MARK) stamped on our own outbound sockets; 0 disables it.
+	# Set this to 0xff when Passwall2 (or any TPROXY-style proxy) runs on this
+	# router: Passwall2's output chain starts with `meta mark 0xff ... return`,
+	# so a marked packet skips its interception and routes normally out the WAN.
+	# Without it Passwall2 policy-routes the relay's own connection into itself,
+	# the real server never sees it, and every connection dies after 2 seconds.
+	option fwmark '0'
 
 # Where the LuCI "Update" button pulls releases from. Kept in UCI (never taken
 # from the browser) so the download URL cannot be influenced by a web request.

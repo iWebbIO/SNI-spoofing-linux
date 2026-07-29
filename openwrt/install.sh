@@ -88,7 +88,7 @@ else
 	echo "[=] Keeping existing /etc/config/sni-spoof"
 	# Backfill options added by newer versions, so an upgrade does not leave the
 	# service reading defaults for settings the UI now exposes.
-	for opt in no_bpf bind_interface; do
+	for opt in no_bpf bind_interface fwmark; do
 		uci -q get "sni-spoof.main.$opt" >/dev/null 2>&1 || \
 			uci -q set "sni-spoof.main.$opt=0"
 	done

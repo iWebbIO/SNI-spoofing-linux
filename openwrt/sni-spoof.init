@@ -22,7 +22,7 @@ extra_command "check" "Diagnose the installation and report what is wrong"
 # can decide whether to actually launch (the JSON itself goes to the file).
 gen_config() {
 	local enabled listen_host listen_port connect_ip connect_port fake_sni
-	local interface backend bind_interface
+	local interface backend bind_interface fwmark
 	config_load 'sni-spoof'
 	config_get enabled        main enabled        0
 	config_get listen_host    main listen_host    '127.0.0.1'
@@ -33,8 +33,10 @@ gen_config() {
 	config_get interface      main interface      'default'
 	config_get backend        main backend        'auto'
 	config_get bind_interface main bind_interface 0
+	config_get fwmark         main fwmark         0
 
 	[ "$bind_interface" = "1" ] && bind_interface=true || bind_interface=false
+	[ -n "$fwmark" ] || fwmark=0
 
 	cat > "$CONF_JSON" <<-EOF
 	{
@@ -46,6 +48,7 @@ gen_config() {
 	  "INTERFACE": "$interface",
 	  "BACKEND": "$backend",
 	  "BIND_INTERFACE": $bind_interface,
+	  "FWMARK": "$fwmark",
 	  "AUTO_SELECT_INTERFACE": true
 	}
 	EOF
@@ -100,7 +103,7 @@ _warn() { echo "  [WARN] $*"; }
 _bad()  { echo "  [FAIL] $*"; }
 
 check() {
-	local enabled listen_host listen_port connect_ip connect_port interface no_bpf
+	local enabled listen_host listen_port connect_ip connect_port interface no_bpf fwmark
 	config_load 'sni-spoof'
 	config_get enabled      main enabled      0
 	config_get listen_host  main listen_host  '127.0.0.1'
@@ -109,12 +112,13 @@ check() {
 	config_get connect_port main connect_port 443
 	config_get interface    main interface    'default'
 	config_get no_bpf       main no_bpf       0
+	config_get fwmark       main fwmark       0
 
 	echo "=== SNI-Spoofing diagnostics ==============================="
 	echo
 	echo "Version : $(cat "$PROG_DIR/VERSION" 2>/dev/null || echo unknown)"
 	echo "Config  : $listen_host:$listen_port -> $connect_ip:$connect_port"
-	echo "          interface=$interface  no_bpf=$no_bpf  enabled=$enabled"
+	echo "          interface=$interface  no_bpf=$no_bpf  fwmark=$fwmark  enabled=$enabled"
 	echo
 
 	echo "-- Runtime -------------------------------------------------"
@@ -183,32 +187,62 @@ check() {
 	# This is the one that actually bites. AF_PACKET taps AFTER nat, so anything
 	# that redirects the relay's own outbound connection makes it invisible to
 	# the injector — the desync then silently never fires.
-	if [ -d /etc/config ] && [ -f /etc/config/passwall2 ]; then
-		_ok "Passwall2 is installed"
-		if uci -q show passwall2 | grep -qF "$connect_ip"; then
-			_ok "$connect_ip appears in the Passwall2 configuration (bypass list?)"
+	# Two very different mechanisms have to be detected here. A *redirect/DNAT*
+	# rewrites the destination, which is easy to spot. A *TPROXY* setup does not
+	# touch the addresses at all — it sets an fwmark and lets a policy route
+	# hand the packet to a local proxy. The second kind is what Passwall2 uses,
+	# and it is invisible to a naive "is the destination still right" check.
+	local intercepted=0
+	if [ -f /etc/config/passwall2 ]; then
+		if [ "$(uci -q get passwall2.@global[0].enabled)" = "1" ]; then
+			_warn "Passwall2 is installed and ENABLED"
+			intercepted=1
 		else
-			_warn "$connect_ip is NOT mentioned anywhere in the Passwall2 config"
-			echo "         The relay's own connection to the server will be re-proxied,"
-			echo "         which breaks the desync. Add it to the direct/bypass list:"
-			echo "           uci add_list passwall2.@global[0].direct_ip=$connect_ip"
-			echo "           uci commit passwall2 && /etc/init.d/passwall2 restart"
+			_ok "Passwall2 is installed but disabled"
 		fi
 	else
 		echo "  [ -- ] Passwall2 not installed"
 	fi
 
 	if command -v nft >/dev/null 2>&1; then
-		local redirects
+		local redirects marked
 		redirects="$(nft list ruleset 2>/dev/null \
 			| awk '/hook output/,/^[[:space:]]*}/' \
 			| grep -ciE 'redirect|tproxy|dnat' 2>/dev/null)"
+		# A jump out of an output-hooked chain into a proxy's own chain is the
+		# TPROXY tell-tale, as is any fwmark-based ip rule.
+		marked="$(nft list ruleset 2>/dev/null \
+			| awk '/hook output/,/^[[:space:]]*}/' \
+			| grep -ciE 'jump (PSW|SS_|SHUNT)|mark set' 2>/dev/null)"
 		if [ "${redirects:-0}" -gt 0 ]; then
 			_warn "$redirects redirect/tproxy/dnat rule(s) in an output hook"
-			echo "         Something rewrites this router's own outgoing connections."
-			echo "         If $connect_ip is not exempted, the desync cannot work."
+			intercepted=1
+		fi
+		if [ "${marked:-0}" -gt 0 ]; then
+			_warn "$marked fwmark/proxy-jump rule(s) in an output hook (TPROXY-style)"
+			echo "         This router diverts its OWN outgoing connections to a local"
+			echo "         proxy without changing their addresses."
+			intercepted=1
+		fi
+		[ "${redirects:-0}" -eq 0 ] && [ "${marked:-0}" -eq 0 ] && \
+			_ok "no interception rules found in any output hook"
+	fi
+
+	if [ "$intercepted" = "1" ]; then
+		if [ "${fwmark:-0}" != "0" ]; then
+			_ok "fwmark $fwmark is set — our own sockets should bypass the proxy"
+			echo "         (the live wire test below confirms whether it works)"
 		else
-			_ok "no redirect/tproxy/dnat rules in any output hook"
+			_bad "the relay's own connection will be swallowed by the local proxy"
+			echo "         The server never sees it, so the desync cannot fire and every"
+			echo "         connection dies after 2s. Passwall2 exempts anything marked"
+			echo "         0xff, so mark our sockets:"
+			echo
+			echo "           uci set sni-spoof.main.fwmark='0xff'"
+			echo "           uci commit sni-spoof && /etc/init.d/sni-spoof restart"
+			echo
+			echo "         (No Passwall2 change needed, and it keeps working whatever"
+			echo "          server IP you use.)"
 		fi
 	fi
 

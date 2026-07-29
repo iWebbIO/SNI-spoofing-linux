@@ -52,6 +52,19 @@ def default_route_ip(addr):
         s.close()
 
 
+def route_device(addr):
+    """The device `ip route get` says this destination should leave by, or ''."""
+    try:
+        import subprocess
+        out = subprocess.run(["ip", "route", "get", addr], capture_output=True,
+                             text=True, timeout=5).stdout.split()
+        if "dev" in out:
+            return out[out.index("dev") + 1]
+    except Exception:
+        pass
+    return ""
+
+
 def main():
     cfg = load_config()
     dst_ip = cfg.get("CONNECT_IP", "")
@@ -61,8 +74,12 @@ def main():
         return 2
 
     local_ip = default_route_ip(dst_ip)
+    expect_dev = route_device(dst_ip)
+    fwmark = int(str(cfg.get("FWMARK", 0) or 0), 0)
     print(f"Target      : {dst_ip}:{dst_port}")
     print(f"Local IPv4  : {local_ip or '(none — no route to the target!)'}")
+    print(f"Egress dev  : {expect_dev or '(unknown)'}")
+    print(f"fwmark      : {hex(fwmark) if fwmark else 'off'}")
     if not local_ip:
         print("\n[FAIL] The router has no source address for this destination.")
         print("       Fix routing/WAN first; nothing else can work.")
@@ -120,6 +137,8 @@ def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(3)
     try:
+        if fwmark:
+            s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_MARK", 36), fwmark)
         s.bind((local_ip, 0))
         s.connect((dst_ip, dst_port))
         connected = True
@@ -139,37 +158,52 @@ def main():
     print(f"  Duplicate copies: {seen['dupes']}")
     print()
 
+    devs = seen["ifaces"]
+    real_devs = devs - {"lo"}
+
     rc = 0
     if seen["out_syn"] == 0:
         rc = 1
-        print("[FAIL] No outbound SYN with this destination ever reached the wire.")
-        print("       The connection is being redirected before egress, so the")
-        print("       injector can never observe it and the desync cannot fire.")
+        print("[FAIL] No outbound SYN with this destination was seen at all.")
+        print("       Something rewrote the destination before egress, so the")
+        print("       injector can never observe this flow.")
+        print(f"       Set a bypass fwmark:  uci set sni-spoof.main.fwmark=0xff")
+    elif expect_dev and expect_dev not in devs and not real_devs:
+        # The give-away for TPROXY-style interception: the packets keep their
+        # original destination (so the naive "did we see a SYN" check passes)
+        # but are policy-routed to loopback and handed to a local proxy. They
+        # never touch the WAN, so the real server never sees them.
+        rc = 1
+        print(f"[FAIL] The connection never left via {expect_dev} — it was diverted to "
+              f"{', '.join(sorted(devs))}.")
+        print("       A transparent proxy on this router (Passwall2/TPROXY) is")
+        print("       policy-routing the relay's own connection into itself. The")
+        print("       real server never sees it, so the desync cannot work.")
         print()
-        print("       On OpenWRT this is almost always Passwall2 re-proxying the")
-        print("       router's own traffic. Fix it by adding the server IP to")
-        print("       Passwall2's direct/bypass list:")
+        print("       Passwall2 exempts anything marked 0xff, so mark our sockets:")
         print()
-        print(f"         uci add_list passwall2.@global[0].direct_ip={dst_ip}")
-        print( "         uci commit passwall2 && /etc/init.d/passwall2 restart")
+        print("         uci set sni-spoof.main.fwmark='0xff'")
+        print("         uci commit sni-spoof && /etc/init.d/sni-spoof restart")
         print()
-        print("       (Option names vary between Passwall2 versions — the goal is")
-        print("        simply that this IP is routed DIRECT, never through a node.)")
+        print("       (That needs no Passwall2 change and keeps working whatever")
+        print("        server IP you use. Alternatively add the IP to Passwall2's")
+        print(f"        direct list: uci add_list passwall2.@global[0].direct_ip={dst_ip})")
     elif not connected:
         rc = 1
         print("[FAIL] Packets left the box but the connection did not complete.")
         print("       The server is unreachable or filtered upstream. Not a desync")
         print("       problem — check the server IP/port and the WAN link.")
     else:
-        print("[ OK ] The relay's own flow reaches the wire and is visible to the")
-        print("       injector. The desync has everything it needs.")
+        print(f"[ OK ] The relay's own flow egresses via {', '.join(sorted(real_devs))} "
+              f"and is visible to the injector.")
+        print("       The desync has everything it needs.")
 
-    if len(seen["ifaces"]) > 1 or seen["dupes"]:
+    if seen["dupes"]:
         print()
-        print(f"[NOTE] The same packets were tapped on {len(seen['ifaces'])} devices "
-              f"({seen['dupes']} duplicate copies).")
-        print("       That is normal for a stacked WAN (PPPoE/VLAN/DSA) and is")
-        print("       handled — the engine collapses duplicates. No action needed.")
+        print(f"[NOTE] {seen['dupes']} duplicate copies across "
+              f"{len(devs)} device(s): {', '.join(sorted(devs))}.")
+        print("       Normal for a stacked egress path (DSA port over conduit,")
+        print("       PPPoE/VLAN, or loopback). The engine collapses duplicates.")
 
     return rc
 

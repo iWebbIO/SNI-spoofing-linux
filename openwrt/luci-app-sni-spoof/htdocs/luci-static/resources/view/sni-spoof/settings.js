@@ -173,6 +173,16 @@ return view.extend({
 			o.value(name, label);
 		});
 
+		o = s.option(form.Value, 'fwmark', _('Bypass fwmark'),
+			_('Firewall mark stamped on the relay’s own outbound sockets; <code>0</code> ' +
+			  'disables it. <strong>Set this to <code>0xff</code> if Passwall2 runs on ' +
+			  'this router.</strong> Passwall2 diverts the router’s own connections into ' +
+			  'its proxy, which silently breaks the desync — but it lets anything marked ' +
+			  '0xff through untouched. Needs no Passwall2 configuration.'));
+		o.placeholder = '0';
+		o.value('0', _('Disabled'));
+		o.value('0xff', _('0xff — bypass Passwall2'));
+
 		o = s.option(form.Flag, 'no_bpf', _('Disable kernel packet filter'),
 			_('Skip the in-kernel BPF capture filter and use the Python filter alone. ' +
 			  'Slightly more CPU, but immune to a kernel whose BPF drops our packets. ' +

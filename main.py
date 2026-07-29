@@ -61,6 +61,16 @@ DEFAULT_CONFIG = {
     # virtualised NICs. Duplicate frames from a stacked WAN are handled without
     # it, so turn this on only to shave CPU on a very busy router.
     "BIND_INTERFACE": False,
+    # Linux fwmark (SO_MARK) to stamp on our own outbound sockets, or 0 to
+    # disable. This is what keeps a transparent proxy on the same box from
+    # swallowing the relay's own connection to the server.
+    #
+    # On OpenWRT with Passwall2 the correct value is 0xff: Passwall2's own
+    # output chain begins with `meta mark 0x000000ff ... return`, so a marked
+    # packet skips its TPROXY interception and routes normally out the WAN.
+    # Without it, Passwall2 policy-routes our connection to loopback and into
+    # its proxy, the real server never sees it, and the desync cannot work.
+    "FWMARK": 0,
 }
 
 
@@ -95,6 +105,20 @@ AUTO_SELECT_INTERFACE = bool(config.get("AUTO_SELECT_INTERFACE", False))
 CONFIG_INTERFACE = str(config.get("INTERFACE", "") or "").strip()
 BIND_INTERFACE = bool(config.get("BIND_INTERFACE", False))
 INTERFACE_IPV4 = get_default_interface_ipv4(CONNECT_IP)
+
+
+def _parse_mark(value) -> int:
+    """Accept 255, "255" or "0xff" — UCI and JSON both end up here."""
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip() or "0", 0)
+    except ValueError:
+        print(f"[Warning] Invalid FWMARK {value!r}; ignoring.")
+        return 0
+
+
+FWMARK = _parse_mark(config.get("FWMARK", 0))
 
 
 def _looks_like_ipv4(s: str) -> bool:
@@ -161,6 +185,8 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
             sys.exit("impossible mode!")
         outgoing_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         outgoing_sock.setblocking(False)
+        # Mark before bind/connect so the very first SYN already carries it.
+        set_fwmark(outgoing_sock, "outbound socket")
         outgoing_sock.bind((INTERFACE_IPV4, 0))
         outgoing_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         _set_keepalive(outgoing_sock)
@@ -273,6 +299,23 @@ def report_desync_timeout(conn, conn_id: str):
         print(f"        It was likely dropped in transit — by conntrack marking it INVALID, or "
               f"by the DPI itself.")
         print(f"        Try SNI_NO_BPF=1 (UCI option 'no_bpf 1') to rule out the kernel filter.")
+
+
+def set_fwmark(sock: socket.socket, what: str = "socket"):
+    """Stamp SO_MARK on ``sock`` so an on-box transparent proxy leaves it alone.
+
+    Both of our outbound sockets need this — the TCP connection to the server
+    *and* the raw socket that injects the fake ClientHello. If only one carried
+    the mark the two halves of the same flow would take different paths.
+    """
+    if not FWMARK:
+        return
+    so_mark = getattr(socket, "SO_MARK", 36)  # linux/asm-generic/socket.h
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, so_mark, FWMARK)
+    except OSError as e:
+        print(f"[Warning] Could not set fwmark {FWMARK:#x} on the {what} ({e}). "
+              f"Needs root/CAP_NET_ADMIN on Linux.")
 
 
 def _set_keepalive(sock: socket.socket):
@@ -412,7 +455,7 @@ def run_injector_safe(local_ip: str):
     global fake_tcp_injector
     try:
         engine = create_engine(local_ip, CONNECT_IP, CONNECT_PORT, backend=BACKEND,
-                               bind_interface=BIND_INTERFACE)
+                               bind_interface=BIND_INTERFACE, fwmark=FWMARK)
         fake_tcp_injector = FakeTcpInjector(engine, fake_injective_connections)
         fake_tcp_injector.run()
     except Exception as e:

@@ -132,7 +132,8 @@ def _build_bpf(local_ip: str, dst_ip: str) -> bytes:
 
 
 class RawSocketEngine:
-    def __init__(self, local_ip: str, dst_ip: str, dst_port: int, bind_interface: bool = False):
+    def __init__(self, local_ip: str, dst_ip: str, dst_port: int, bind_interface: bool = False,
+                 fwmark: int = 0):
         self.local_ip = local_ip
         self.dst_ip = dst_ip
         self.dst_port = dst_port
@@ -140,6 +141,11 @@ class RawSocketEngine:
         self._local_ip_packed = socket.inet_aton(local_ip)
         self.ifname = ifname_for_ip(local_ip)
         self.bind_interface = bind_interface
+        # The injected packet must take the same path as the connection it
+        # belongs to. If the relay's TCP socket is marked to bypass an on-box
+        # transparent proxy but this raw socket is not, the fake ClientHello is
+        # policy-routed into the proxy while the real flow goes out the WAN.
+        self.fwmark = fwmark
         self.recv_sock = None
         self.send_sock = None
         # Counters keyed by packet signature. Two distinct jobs:
@@ -211,6 +217,13 @@ class RawSocketEngine:
             self.send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         except OSError:
             pass  # IPPROTO_RAW already implies HDRINCL on Linux
+        if self.fwmark:
+            try:
+                so_mark = getattr(socket, "SO_MARK", 36)
+                self.send_sock.setsockopt(socket.SOL_SOCKET, so_mark, self.fwmark)
+            except OSError as e:
+                print(f"[Warning] Could not set fwmark {self.fwmark:#x} on the "
+                      f"injection socket ({e}).")
 
     def recv(self, bufsize: int = 65565):
         sock = self.recv_sock

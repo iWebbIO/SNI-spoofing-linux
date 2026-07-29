@@ -27,12 +27,12 @@ def detect_backend() -> str:
 
 
 def create_engine(local_ip: str, dst_ip: str, dst_port: int, backend: str = None,
-                  bind_interface: bool = False):
+                  bind_interface: bool = False, fwmark: int = 0):
     """Build a packet engine for the flow local_ip -> dst_ip:dst_port.
 
     ``backend`` may be forced to "windivert" / "raw" / "scapy"; otherwise it is
-    auto-detected from the host platform. ``bind_interface`` is honoured by the
-    raw engine only (it has no meaning for WinDivert or scapy).
+    auto-detected from the host platform. ``bind_interface`` and ``fwmark`` are
+    Linux concepts honoured by the raw engine only.
     """
     backend = backend or detect_backend()
 
@@ -41,7 +41,8 @@ def create_engine(local_ip: str, dst_ip: str, dst_port: int, backend: str = None
         return windivert_engine.create(local_ip, dst_ip, dst_port)
     if backend == "raw":
         from engines.raw_socket_engine import RawSocketEngine
-        return RawSocketEngine(local_ip, dst_ip, dst_port, bind_interface=bind_interface)
+        return RawSocketEngine(local_ip, dst_ip, dst_port,
+                               bind_interface=bind_interface, fwmark=fwmark)
     if backend == "scapy":
         from engines.scapy_engine import ScapyEngine
         return ScapyEngine(local_ip, dst_ip, dst_port)
