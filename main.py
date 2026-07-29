@@ -119,6 +119,9 @@ def _parse_mark(value) -> int:
 
 
 FWMARK = _parse_mark(config.get("FWMARK", 0))
+# SNI_TRACE=1 logs every packet the state machine acts on. Very noisy; meant for
+# working out why a particular connection failed, not for normal running.
+TRACE = os.environ.get("SNI_TRACE") == "1"
 
 
 def _looks_like_ipv4(s: str) -> bool:
@@ -198,7 +201,10 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
         try:
             try:
                 await loop.sock_connect(outgoing_sock, (CONNECT_IP, CONNECT_PORT))
-            except Exception:
+            except Exception as e:
+                print(f"[Error] {conn_id}: could not connect to "
+                      f"{CONNECT_IP}:{CONNECT_PORT} from {INTERFACE_IPV4}:{src_port} "
+                      f"({type(e).__name__}: {e})", flush=True)
                 outgoing_sock.close()
                 incoming_sock.close()
                 return
@@ -211,16 +217,24 @@ async def handle(incoming_sock: socket.socket, incoming_remote_addr):
                     outgoing_sock.close()
                     incoming_sock.close()
                     return
-                except Exception:
+                except Exception as e:
+                    print(f"[Error] {conn_id}: desync wait failed "
+                          f"({type(e).__name__}: {e})", flush=True)
                     outgoing_sock.close()
                     incoming_sock.close()
                     return
                 if fake_injective_conn.t2a_msg == "unexpected_close":
+                    print(f"[Error] {conn_id}: desync aborted (unexpected packet) on "
+                          f"{INTERFACE_IPV4}:{src_port} -> {CONNECT_IP}:{CONNECT_PORT}",
+                          flush=True)
                     outgoing_sock.close()
                     incoming_sock.close()
                     return
                 if fake_injective_conn.t2a_msg != "fake_data_ack_recv":
                     sys.exit("impossible t2a msg!")
+                if TRACE:
+                    print(f"[Trace] {conn_id}: desync OK on {INTERFACE_IPV4}:{src_port}",
+                          flush=True)
             else:
                 sys.exit("unknown bypass method!")
         finally:

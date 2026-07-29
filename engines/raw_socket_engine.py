@@ -298,6 +298,7 @@ class RawSocketEngine:
 
         pkt.is_outbound = outbound
         pkt.is_inbound = not outbound
+        pkt.capture_dev = addr[0]
         self.stats["delivered"] += 1
         return pkt
 

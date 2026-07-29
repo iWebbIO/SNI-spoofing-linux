@@ -202,6 +202,11 @@ class IPv4TCPPacket:
         "_src_port", "_dst_port", "_seq", "_ack", "_data_off", "_flags",
         "_window", "_urg", "tcp_options", "_payload",
         "is_inbound", "is_outbound", "ip", "ipv4", "tcp",
+        # Which netdev the sniffing engine saw this on. Diagnostics only, but
+        # essential ones: on a stacked egress path the same packet is tapped
+        # once per layer, and knowing which layer a stray copy came from is the
+        # difference between a guess and an answer.
+        "capture_dev",
     )
 
     def __init__(self):
@@ -210,6 +215,23 @@ class IPv4TCPPacket:
         self.ip = _IPView(self)
         self.ipv4 = _IPv4View(self)
         self.tcp = _TCPView(self)
+        self.capture_dev = ""
+
+    def __repr__(self):
+        """Readable one-liner — the state machine prints packets in its error
+        paths, and the default object repr made those messages useless."""
+        flags = "".join(n for n, b in (("S", 0x02), ("A", 0x10), ("F", 0x01),
+                                       ("R", 0x04), ("P", 0x08)) if self._flags & b)
+        try:
+            src = socket.inet_ntoa(self._src_ip)
+            dst = socket.inet_ntoa(self._dst_ip)
+        except (OSError, AttributeError):
+            src = dst = "?"
+        direction = "OUT" if self.is_outbound else ("IN " if self.is_inbound else "?  ")
+        dev = f" dev={self.capture_dev}" if self.capture_dev else ""
+        return (f"<{direction} {src}:{self._src_port} > {dst}:{self._dst_port} "
+                f"[{flags or '-'}] seq={self._seq} ack={self._ack} "
+                f"len={len(self._payload)}{dev}>")
 
     # -- parsing ---------------------------------------------------------
     @classmethod

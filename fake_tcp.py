@@ -1,8 +1,14 @@
 import asyncio
+import os
 import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+# SNI_TRACE=1 prints every packet the state machine handles, with the connection
+# state at that moment. Noisy by design — this is the tool for working out why
+# one particular connection failed.
+TRACE = os.environ.get("SNI_TRACE") == "1"
 
 from monitor_connection import MonitorConnection
 from injecter import TcpInjector
@@ -61,7 +67,15 @@ class FakeTcpInjector(TcpInjector):
                 sys.exit("not implemented method!")
 
     def on_unexpected_packet(self, packet, connection: FakeInjectiveConnection, info_m: str):
-        print(info_m, packet)
+        # Print the connection's expected state alongside the offending packet.
+        # "unexpected packet" on its own says nothing about *why* it was
+        # unexpected, which made these failures very hard to chase down.
+        print(f"[Desync] {info_m}\n"
+              f"         packet: {packet!r}\n"
+              f"         state:  syn_seq={connection.syn_seq} "
+              f"syn_ack_seq={connection.syn_ack_seq} "
+              f"sch_fake_sent={connection.sch_fake_sent} "
+              f"fake_sent={connection.fake_sent}", flush=True)
         connection.sock.close()
         connection.peer_sock.close()
         connection.monitor = False
@@ -155,6 +169,8 @@ class FakeTcpInjector(TcpInjector):
         return
 
     def inject(self, packet):
+        if TRACE:
+            print(f"[Trace] {packet!r}", flush=True)
         if packet.is_inbound:
             c_id = (packet.ip.dst_addr, packet.tcp.dst_port, packet.ip.src_addr, packet.tcp.src_port)
             try:
